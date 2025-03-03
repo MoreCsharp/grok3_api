@@ -1,4 +1,4 @@
-name: Manual Build YouChatProxy
+name: Manual Build grok3_api
 
 on:
   workflow_dispatch:  # 仅允许手动触发
