@@ -34,10 +34,10 @@ USER appuser
 
 # 公开你的应用程序侦听的端口（请替换为你实际的端口）。
 # 你需要确定 grok3_api 使用的端口并将其放在这里。
-EXPOSE 8180  # 将 8080 替换为 grok3_api 使用的实际端口！
+EXPOSE 8080
 
 # 定义容器的入口点。
 ENTRYPOINT ["/usr/local/bin/grok3_api"]
 
 # 可选：设置默认的命令参数（如果你的应用程序使用它们）。
-# CMD ["--some-flag", "some-value"]
+CMD ["-port", "8080"]
