@@ -40,4 +40,4 @@ EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/grok3_api"]
 
 # 可选：设置默认的命令参数（如果你的应用程序使用它们）。
-CMD ["-port", "8080"]
+CMD ["-port", "8080", "-ignoreThinking", "true"]
