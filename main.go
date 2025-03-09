@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -21,17 +23,17 @@ import (
 // GrokClient defines a client for interacting with the Grok 3 Web API.
 // It encapsulates the API endpoints, HTTP headers, and configuration flags.
 type GrokClient struct {
-	newUrl         string            // Endpoint for creating new conversations
 	headers        map[string]string // HTTP headers for API requests
 	isReasoning    bool              // Flag for using reasoning model
+	enableSearch   bool              // Flag for searching in the Web
+	uploadMessage  bool              // Flag for uploading the message as a file
 	keepChat       bool              // Flag to preserve chat history
 	ignoreThinking bool              // Flag to exclude thinking tokens in responses
 }
 
 // NewGrokClient creates a new instance of GrokClient with the provided cookies and configuration flags.
-func NewGrokClient(cookies string, isReasoning bool, keepChat bool, ignoreThinking bool) *GrokClient {
+func NewGrokClient(cookie string, isReasoning bool, enableSearch bool, uploadMessage bool, keepChat bool, ignoreThinking bool) *GrokClient {
 	return &GrokClient{
-		newUrl: "https://grok.com/rest/app-chat/conversations/new",
 		headers: map[string]string{
 			"accept":             "*/*",
 			"accept-language":    "en-GB,en;q=0.9",
@@ -47,36 +49,57 @@ func NewGrokClient(cookies string, isReasoning bool, keepChat bool, ignoreThinki
 			"sec-fetch-site":     "same-origin",
 			"sec-gpc":            "1",
 			"user-agent":         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-			"cookie":             cookies,
+			"cookie":             cookie,
 		},
 		isReasoning:    isReasoning,
+		enableSearch:   enableSearch,
+		uploadMessage:  uploadMessage,
 		keepChat:       keepChat,
 		ignoreThinking: ignoreThinking,
 	}
 }
 
+type ToolOverrides struct {
+	ImageGen     bool `json:"imageGen"`
+	TrendsSearch bool `json:"trendsSearch"`
+	WebSearch    bool `json:"webSearch"`
+	XMediaSearch bool `json:"xMediaSearch"`
+	XPostAnalyze bool `json:"xPostAnalyze"`
+	XSearch      bool `json:"xSearch"`
+}
+
 // preparePayload constructs the request payload for the Grok 3 Web API based on the given message and reasoning flag.
-func (c *GrokClient) preparePayload(message string, isReasoning bool) map[string]any {
+func (c *GrokClient) preparePayload(message string, fileId string) map[string]any {
+	var toolOverrides any = ToolOverrides{}
+	if c.enableSearch {
+		toolOverrides = map[string]any{}
+	}
+
+	fileAttachments := []string{}
+	if fileId != "" {
+		fileAttachments = []string{fileId}
+	}
+
 	return map[string]any{
-		"customInstructions":        "",
 		"deepsearchPreset":          "",
 		"disableSearch":             false,
 		"enableImageGeneration":     true,
 		"enableImageStreaming":      true,
 		"enableSideBySide":          true,
-		"fileAttachments":           []string{},
+		"fileAttachments":           fileAttachments,
 		"forceConcise":              false,
 		"imageAttachments":          []string{},
 		"imageGenerationCount":      2,
 		"isPreset":                  false,
-		"isReasoning":               isReasoning,
+		"isReasoning":               c.isReasoning,
 		"message":                   message,
 		"modelName":                 "grok-3",
 		"returnImageBytes":          false,
 		"returnRawGrokInXaiRequest": false,
 		"sendFinalMetadata":         true,
 		"temporary":                 !c.keepChat,
-		"toolOverrides":             map[string]any{},
+		"toolOverrides":             toolOverrides,
+		"webpageUrls":               []string{},
 	}
 }
 
@@ -98,8 +121,10 @@ type RequestBody struct {
 		Content string `json:"content"`
 	} `json:"messages"`
 	Stream           bool   `json:"stream"`
-	GrokCookies      any    `json:"grokCookies,omitempty"` // A single cookie(string), or a list of cookie([]string)
-	CookieIndex      uint   `json:"cookieIndex,omitempty"` // Start from 1, 0 means auto-select cookies in turn
+	GrokCookies      any    `json:"grokCookies,omitempty"`   // A single cookie(string), or a list of cookie([]string)
+	CookieIndex      uint   `json:"cookieIndex,omitempty"`   // Start from 1, 0 means auto-select cookies in turn
+	EnableSearch     int    `json:"enableSearch,omitempty"`  // > 0 is true, == 0 is false
+	UploadMessage    int    `json:"uploadMessage,omitempty"` // > 0 is true, == 0 is false
 	TextBeforePrompt string `json:"textBeforePrompt,omitempty"`
 	TextAfterPrompt  string `json:"textAfterPrompt,omitempty"`
 	KeepChat         int    `json:"keepChat,omitempty"`       // > 0 is true, == 0 is false
@@ -129,12 +154,31 @@ type ModelList struct {
 	Data   []ModelData `json:"data"`
 }
 
+// UploadFileRequest represents the request for uploading a file.
+type UploadFileRequest struct {
+	Content      string `json:"content"`
+	FileMimeType string `json:"fileMimeType"`
+	FileName     string `json:"fileName"`
+}
+
+// UploadFileResponse represents the response for uploading a file.
+type UploadFileResponse struct {
+	FileMetadataId string `json:"fileMetadataId"`
+}
+
 const (
+	newChatUrl    = "https://grok.com/rest/app-chat/conversations/new" // Endpoint for creating new conversations
+	uploadFileUrl = "https://grok.com/rest/app-chat/upload-file"       // Endpoint for uploading files
+
 	grok3ModelName          = "grok-3"
 	grok3ReasoningModelName = "grok-3-reasoning"
 
 	completionsPath = "/v1/chat/completions"
 	listModelsPath  = "/v1/models"
+
+	messageCharLimit = 40000
+
+	defaultBeforePromptText = "For the data below, entries with 'system' are system information, entries with 'assistant' are messages you have previously sent, entries with 'user' are messages sent by the user. You need to respond to the user's last message accordingly based on the corresponding data."
 )
 
 // Global configuration variables set.
@@ -153,16 +197,14 @@ var (
 	}{}
 )
 
-// sendMessage sends a message to the Grok 3 Web API and returns the response body as an io.ReadCloser.
-// If stream is true, it returns the streaming response; otherwise, it reads the entire response.
-func (c *GrokClient) sendMessage(message string, stream bool) (io.ReadCloser, error) {
-	payload := c.preparePayload(message, c.isReasoning)
+// doRequest sends the HTTP request.
+func (c *GrokClient) doRequest(method string, url string, payload any) (*http.Response, error) {
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal payload: %v", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, c.newUrl, bytes.NewBuffer(jsonPayload))
+	req, err := http.NewRequest(method, url, bytes.NewBuffer(jsonPayload))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
@@ -182,6 +224,57 @@ func (c *GrokClient) sendMessage(message string, stream bool) (io.ReadCloser, er
 			return nil, fmt.Errorf("the Grok API error: %d %s", resp.StatusCode, resp.Status)
 		}
 		return nil, fmt.Errorf("the Grok API error: %d %s, response body: %s", resp.StatusCode, resp.Status, string(body))
+	}
+
+	return resp, nil
+}
+
+func (c *GrokClient) uploadMessageAsFile(message string) (*UploadFileResponse, error) {
+	content := base64.StdEncoding.EncodeToString([]byte(message))
+	payload := UploadFileRequest{
+		Content:      content,
+		FileMimeType: "text/plain",
+		FileName:     uuid.New().String() + ".txt",
+	}
+	log.Println("Uploading the message as a file")
+	resp, err := c.doRequest(http.MethodPost, uploadFileUrl, payload)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("uploading file error: %d %s", resp.StatusCode, resp.Status)
+	}
+	response := &UploadFileResponse{}
+	err = json.Unmarshal(body, response)
+	if err != nil {
+		return nil, fmt.Errorf("parsing json error: %s", string(body))
+	}
+	if response.FileMetadataId == "" {
+		return nil, fmt.Errorf("uploading file error: empty `FileMetadataId`")
+	}
+
+	return response, nil
+}
+
+// sendMessage sends a message to the Grok 3 Web API and returns the response body as an io.ReadCloser.
+// If stream is true, it returns the streaming response; otherwise, it reads the entire response.
+func (c *GrokClient) sendMessage(message string, stream bool) (io.ReadCloser, error) {
+	fileId := ""
+	if c.uploadMessage || (len(message) > messageCharLimit && utf8.RuneCountInString(message) > messageCharLimit) {
+		uploadResp, err := c.uploadMessageAsFile(message)
+		if err != nil {
+			return nil, err
+		}
+		fileId = uploadResp.FileMetadataId
+		message = "Follow the instructions in the attached file to respond."
+	}
+
+	payload := c.preparePayload(message, fileId)
+	resp, err := c.doRequest(http.MethodPost, newChatUrl, payload)
+	if err != nil {
+		return nil, err
 	}
 
 	if stream {
@@ -238,6 +331,41 @@ type OpenAIChatCompletion struct {
 	Usage   OpenAIChatCompletionUsage    `json:"usage"`
 }
 
+// parseGrok3StreamingJson parses the streaming response from Grok 3.
+func (c *GrokClient) parseGrok3StreamingJson(stream io.Reader, handler func(respToken string)) {
+	// Read and process the streaming response from Grok 3
+	isThinking := false
+	decoder := json.NewDecoder(stream)
+	for {
+		var token ResponseToken
+		err := decoder.Decode(&token)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			log.Printf("Parsing json error: %v", err)
+			break
+		}
+
+		respToken := token.Result.Response.Token
+		// Handle thinking tokens based on configuration
+		if c.ignoreThinking && token.Result.Response.IsThinking {
+			continue
+		} else if token.Result.Response.IsThinking {
+			if !isThinking {
+				respToken = "<think>\n" + respToken
+			}
+			isThinking = true
+		} else if isThinking {
+			respToken = respToken + "\n</think>\n\n"
+			isThinking = false
+		}
+
+		if respToken != "" {
+			handler(respToken)
+		}
+	}
+}
+
 // createOpenAIStreamingResponse returns an HTTP handler that converts the Grok 3 streaming response to OpenAI's streaming format
 // and writes it to the response writer.
 func (c *GrokClient) createOpenAIStreamingResponse(grokStream io.Reader) http.HandlerFunc {
@@ -275,68 +403,26 @@ func (c *GrokClient) createOpenAIStreamingResponse(grokStream io.Reader) http.Ha
 		fmt.Fprintf(w, "data: %s\n\n", mustMarshal(startChunk))
 		flusher.Flush()
 
-		// Read and process the streaming response from Grok 3
-		isThinking := false
-		buffer := make([]byte, 1024)
-		for {
-			n, err := grokStream.Read(buffer)
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				log.Printf("Error reading stream: %v", err)
-				return
-			}
-
-			chunk := string(buffer[:n])
-			lines := strings.SplitSeq(chunk, "\n")
-			for line := range lines {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-
-				var token ResponseToken
-				if err := json.Unmarshal([]byte(line), &token); err != nil {
-					continue
-				}
-
-				respToken := token.Result.Response.Token
-				// Handle thinking tokens based on configuration
-				if c.ignoreThinking && token.Result.Response.IsThinking {
-					continue
-				} else if token.Result.Response.IsThinking {
-					if !isThinking {
-						respToken = "<think>\n" + respToken
-					}
-					isThinking = true
-				} else if isThinking {
-					respToken = respToken + "\n</think>\n\n"
-					isThinking = false
-				}
-
-				if respToken != "" {
-					// Send token as a chunk in OpenAI format
-					chunk := OpenAIChatCompletionChunk{
-						ID:      completionID,
-						Object:  "chat.completion.chunk",
-						Created: time.Now().Unix(),
-						Model:   c.getModelName(),
-						Choices: []OpenAIChatCompletionChunkChoice{
-							{
-								Index: 0,
-								Delta: OpenAIChatCompletionMessage{
-									Content: respToken,
-								},
-								FinishReason: "",
-							},
+		c.parseGrok3StreamingJson(grokStream, func(respToken string) {
+			// Send token as a chunk in OpenAI format
+			chunk := OpenAIChatCompletionChunk{
+				ID:      completionID,
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   c.getModelName(),
+				Choices: []OpenAIChatCompletionChunkChoice{
+					{
+						Index: 0,
+						Delta: OpenAIChatCompletionMessage{
+							Content: respToken,
 						},
-					}
-					fmt.Fprintf(w, "data: %s\n\n", mustMarshal(chunk))
-					flusher.Flush()
-				}
+						FinishReason: "",
+					},
+				},
 			}
-		}
+			fmt.Fprintf(w, "data: %s\n\n", mustMarshal(chunk))
+			flusher.Flush()
+		})
 
 		// Send the final chunk after streaming ends
 		finalChunk := OpenAIChatCompletionChunk{
@@ -367,42 +453,9 @@ func (c *GrokClient) createOpenAIStreamingResponse(grokStream io.Reader) http.Ha
 func (c *GrokClient) createOpenAIFullResponse(grokFull io.Reader) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var fullResponse strings.Builder
-		buf := new(strings.Builder)
-		_, err := io.Copy(buf, grokFull)
-		if err != nil {
-			log.Printf("Reading response error: %v", err)
-			http.Error(w, fmt.Sprintf("Reading response error: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		isThinking := false
-		lines := strings.SplitSeq(buf.String(), "\n")
-		for line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-
-			var token ResponseToken
-			if err := json.Unmarshal([]byte(line), &token); err != nil {
-				continue
-			}
-
-			respToken := token.Result.Response.Token
-			if c.ignoreThinking && token.Result.Response.IsThinking {
-				continue
-			} else if token.Result.Response.IsThinking {
-				if !isThinking {
-					respToken = "<think>\n" + respToken
-				}
-				isThinking = true
-			} else if isThinking {
-				respToken = respToken + "\n</think>\n\n"
-				isThinking = false
-			}
-
+		c.parseGrok3StreamingJson(grokFull, func(respToken string) {
 			fullResponse.WriteString(respToken)
-		}
+		})
 
 		openAIResponse := c.createOpenAIFullResponseBody(fullResponse.String())
 		w.Header().Set("Content-Type", "application/json")
@@ -497,7 +550,7 @@ func handleChatCompletion(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse the request body
-	body := RequestBody{KeepChat: -1, IgnoreThinking: -1}
+	body := RequestBody{EnableSearch: -1, KeepChat: -1, IgnoreThinking: -1}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		log.Println("Bad Request: Invalid JSON")
 		http.Error(w, "Bad Request: Invalid JSON", http.StatusBadRequest)
@@ -538,23 +591,6 @@ func handleChatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Construct the message to send to Grok 3
-	messageJson := bytes.NewBuffer([]byte{})
-	jsonEncoder := json.NewEncoder(messageJson)
-	jsonEncoder.SetEscapeHTML(false) // Don't escape &, <, and >
-	jsonEncoder.SetIndent("", "")
-	err := jsonEncoder.Encode(messages)
-	if err != nil {
-		log.Println("Error: Encoding JSON failed")
-		http.Error(w, "Error: Encoding JSON failed", http.StatusInternalServerError)
-		return
-	}
-	if messageJson.Len() <= 2 {
-		log.Println("Bad Request: No user message found")
-		http.Error(w, "Bad Request: No user message found", http.StatusBadRequest)
-		return
-	}
-
 	var beforePromptText string
 	var afterPromptText string
 	if body.TextBeforePrompt != "" {
@@ -567,12 +603,30 @@ func handleChatCompletion(w http.ResponseWriter, r *http.Request) {
 	} else {
 		afterPromptText = *textAfterPrompt
 	}
-	message := beforePromptText + messageJson.String() + afterPromptText
+
+	// Construct the message to send to Grok 3
+	var messageBuilder strings.Builder
+	fmt.Fprintln(&messageBuilder, beforePromptText)
+	for _, msg := range messages {
+		fmt.Fprintf(&messageBuilder, "\n[[%s]]\n", msg.Role)
+		messageBuilder.WriteString(msg.Content)
+	}
+	fmt.Fprintf(&messageBuilder, "\n%s", afterPromptText)
 
 	// Determine configuration flags
 	isReasoning := false
 	if strings.TrimSpace(body.Model) == grok3ReasoningModelName {
 		isReasoning = true
+	}
+
+	enableSearch := false
+	if body.EnableSearch > 0 {
+		enableSearch = true
+	}
+
+	uploadMessage := false
+	if body.UploadMessage > 0 {
+		uploadMessage = true
 	}
 
 	keepConversation := false
@@ -590,10 +644,10 @@ func handleChatCompletion(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Initialize GrokClient with selected options
-	grokClient := NewGrokClient(cookie, isReasoning, keepConversation, ignoreThink)
+	grokClient := NewGrokClient(cookie, isReasoning, enableSearch, uploadMessage, keepConversation, ignoreThink)
 	log.Printf("Use the cookie with index %d to request Grok 3 Web API", cookieIndex+1)
 	// Send the message to Grok 3 Web API
-	respReader, err := grokClient.sendMessage(message, body.Stream)
+	respReader, err := grokClient.sendMessage(messageBuilder.String(), body.Stream)
 	if err != nil {
 		log.Printf("Error: %v", err)
 		http.Error(w, fmt.Sprintf("Error: %v", err), http.StatusInternalServerError)
@@ -655,9 +709,9 @@ func main() {
 	// Define command-line flags
 	apiToken = flag.String("token", "", "Authentication token (GROK3_AUTH_TOKEN)")
 	cookie := flag.String("cookie", "", "Grok cookie (GROK3_COOKIE)")
-	textBeforePrompt = flag.String("textBeforePrompt", "For the data below, entries with the role 'system' are system information, entries with the role 'assistant' are messages you have previously sent, entries with the role 'user' are messages sent by the user. You need to respond to the user's last message accordingly based on the corresponding data.", "Text before the prompt")
+	textBeforePrompt = flag.String("textBeforePrompt", defaultBeforePromptText, "Text before the prompt")
 	textAfterPrompt = flag.String("textAfterPrompt", "", "Text after the prompt")
-	keepChat = flag.Bool("keepChat", false, "Don't delete the chat conversation after request")
+	keepChat = flag.Bool("keepChat", false, "Retain the chat conversation")
 	ignoreThinking = flag.Bool("ignoreThinking", false, "Ignore the thinking content while using the reasoning model")
 	httpProxy = flag.String("httpProxy", "", "HTTP/SOCKS5 proxy")
 	port := flag.Uint("port", 8180, "Server port")
